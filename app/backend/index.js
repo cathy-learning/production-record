@@ -6,8 +6,10 @@ const sqlite3 = require('sqlite3').verbose();
 
 const app = express();
 const PORT = Number(process.env.PORT || 3001);
+const IS_VERCEL = process.env.VERCEL === '1';
 const DATABASE_FILE =
-  process.env.DATABASE_FILE || path.join(__dirname, 'data', 'production.db');
+  process.env.DATABASE_FILE ||
+  (IS_VERCEL ? '/tmp/production.db' : path.join(__dirname, 'data', 'production.db'));
 
 const SECTION_A_DEFAULT_ROWS = [
   {
@@ -92,17 +94,34 @@ db.serialize(() => {
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-initializeSchema()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`Backend running on port ${PORT}`);
-      console.log(`SQLite file: ${DATABASE_FILE}`);
-    });
-  })
-  .catch((error) => {
-    console.error('Failed to initialize database schema', error);
-    process.exit(1);
+const startupPromise = initializeSchema();
+
+if (IS_VERCEL) {
+  startupPromise.catch((error) => {
+    console.error('Failed to initialize database schema (serverless)', error);
   });
+} else {
+  startupPromise
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`Backend running on port ${PORT}`);
+        console.log(`SQLite file: ${DATABASE_FILE}`);
+      });
+    })
+    .catch((error) => {
+      console.error('Failed to initialize database schema', error);
+      process.exit(1);
+    });
+}
+
+app.use(async (_req, _res, next) => {
+  try {
+    await startupPromise;
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
@@ -774,3 +793,10 @@ function handleApiError(res, error) {
   console.error(error);
   res.status(500).json({ error: 'Internal server error' });
 }
+
+app.use((error, _req, res, _next) => {
+  console.error(error);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+module.exports = app;

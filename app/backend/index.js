@@ -2,11 +2,11 @@ const path = require('path');
 const fs = require('fs');
 const express = require('express');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
 
 const app = express();
 const PORT = Number(process.env.PORT || 3001);
 const IS_VERCEL = process.env.VERCEL === '1';
+const sqlite3 = IS_VERCEL ? null : require('sqlite3').verbose();
 const DATABASE_FILE =
   process.env.DATABASE_FILE ||
   (IS_VERCEL ? '/tmp/production.db' : path.join(__dirname, 'data', 'production.db'));
@@ -83,24 +83,21 @@ const SECTION_A_DEFAULT_ROWS = [
   },
 ];
 
-ensureDatabaseDirectory(DATABASE_FILE);
-
-const db = new sqlite3.Database(DATABASE_FILE);
-
-db.serialize(() => {
-  db.run('PRAGMA foreign_keys = ON');
-});
+let db = null;
+if (!IS_VERCEL) {
+  ensureDatabaseDirectory(DATABASE_FILE);
+  db = new sqlite3.Database(DATABASE_FILE);
+  db.serialize(() => {
+    db.run('PRAGMA foreign_keys = ON');
+  });
+}
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-const startupPromise = initializeSchema();
+const startupPromise = IS_VERCEL ? Promise.resolve() : initializeSchema();
 
-if (IS_VERCEL) {
-  startupPromise.catch((error) => {
-    console.error('Failed to initialize database schema (serverless)', error);
-  });
-} else {
+if (!IS_VERCEL) {
   startupPromise
     .then(() => {
       app.listen(PORT, () => {
@@ -123,6 +120,43 @@ app.use(async (_req, _res, next) => {
   }
 });
 
+const memoryStore = {
+  nextId: 1,
+  records: new Map(),
+};
+
+function toMemoryListItem(record) {
+  return {
+    id: record.id,
+    production_date: record.header.productionDate,
+    product_name: record.header.productName,
+    specifications: record.header.specifications,
+    lot_number: record.header.lotNumber,
+    total_ingredients: record.totalIngredients,
+    manager_signature: record.signatures.manager,
+    qa_signature: record.signatures.qa,
+    reviewer_signature: record.signatures.reviewer,
+    created_at: record.createdAt,
+    updated_at: record.updatedAt,
+  };
+}
+
+function toMemoryRecordPayload(record) {
+  return {
+    id: record.id,
+    header: { ...record.header },
+    sectionA: record.sectionA.map((row) => ({ ...row })),
+    sectionB: record.sectionB.map((row) => ({ ...row })),
+    sectionD: record.sectionD.map((row) => ({ ...row })),
+    sectionE: record.sectionE.map((row) => ({ ...row })),
+    totalIngredients: record.totalIngredients,
+    remarks: record.remarks,
+    signatures: { ...record.signatures },
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+  };
+}
+
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
 });
@@ -134,6 +168,36 @@ app.get('/api/records', async (req, res) => {
   const offset = (page - 1) * pageSize;
 
   try {
+    if (IS_VERCEL) {
+      const keyword = q.toLowerCase();
+      const allRecords = Array.from(memoryStore.records.values());
+      const filtered = keyword
+        ? allRecords.filter((record) => {
+            const product = record.header.productName.toLowerCase();
+            const lot = record.header.lotNumber.toLowerCase();
+            return product.includes(keyword) || lot.includes(keyword);
+          })
+        : allRecords;
+
+      filtered.sort((a, b) => {
+        if (a.updatedAt === b.updatedAt) {
+          return b.id - a.id;
+        }
+        return b.updatedAt.localeCompare(a.updatedAt);
+      });
+
+      const items = filtered
+        .slice(offset, offset + pageSize)
+        .map((record) => toMemoryListItem(record));
+
+      return res.json({
+        items,
+        page,
+        pageSize,
+        total: filtered.length,
+      });
+    }
+
     const whereSql = q
       ? 'WHERE product_name LIKE ? OR lot_number LIKE ?'
       : '';
@@ -184,6 +248,14 @@ app.get('/api/records/:id', async (req, res) => {
   }
 
   try {
+    if (IS_VERCEL) {
+      const memoryRecord = memoryStore.records.get(id);
+      if (!memoryRecord) {
+        return res.status(404).json({ error: 'Record not found' });
+      }
+      return res.json(toMemoryRecordPayload(memoryRecord));
+    }
+
     const record = await get('SELECT * FROM records WHERE id = ?', [id]);
     if (!record) {
       return res.status(404).json({ error: 'Record not found' });
@@ -277,6 +349,27 @@ app.post('/api/records', async (req, res) => {
     const payload = normalizePayload(req.body);
     const now = new Date().toISOString();
 
+    if (IS_VERCEL) {
+      const id = memoryStore.nextId;
+      memoryStore.nextId += 1;
+
+      memoryStore.records.set(id, {
+        id,
+        header: { ...payload.header },
+        sectionA: payload.sectionA.map((row) => ({ ...row })),
+        sectionB: payload.sectionB.map((row) => ({ ...row })),
+        sectionD: payload.sectionD.map((row) => ({ ...row })),
+        sectionE: payload.sectionE.map((row) => ({ ...row })),
+        totalIngredients: payload.totalIngredients,
+        remarks: payload.remarks,
+        signatures: { ...payload.signatures },
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      return res.status(201).json({ id });
+    }
+
     const result = await withTransaction(async () => {
       const insert = await run(
         `
@@ -330,6 +423,30 @@ app.put('/api/records/:id', async (req, res) => {
   }
 
   try {
+    if (IS_VERCEL) {
+      const existing = memoryStore.records.get(id);
+      if (!existing) {
+        return res.status(404).json({ error: 'Record not found' });
+      }
+
+      const payload = normalizePayload(req.body);
+      memoryStore.records.set(id, {
+        id,
+        header: { ...payload.header },
+        sectionA: payload.sectionA.map((row) => ({ ...row })),
+        sectionB: payload.sectionB.map((row) => ({ ...row })),
+        sectionD: payload.sectionD.map((row) => ({ ...row })),
+        sectionE: payload.sectionE.map((row) => ({ ...row })),
+        totalIngredients: payload.totalIngredients,
+        remarks: payload.remarks,
+        signatures: { ...payload.signatures },
+        createdAt: existing.createdAt,
+        updatedAt: new Date().toISOString(),
+      });
+
+      return res.json({ ok: true });
+    }
+
     const exists = await get('SELECT id FROM records WHERE id = ?', [id]);
     if (!exists) {
       return res.status(404).json({ error: 'Record not found' });
@@ -387,6 +504,14 @@ app.delete('/api/records/:id', async (req, res) => {
   }
 
   try {
+    if (IS_VERCEL) {
+      const existed = memoryStore.records.delete(id);
+      if (!existed) {
+        return res.status(404).json({ error: 'Record not found' });
+      }
+      return res.json({ ok: true });
+    }
+
     const result = await run('DELETE FROM records WHERE id = ?', [id]);
     if (!result.changes) {
       return res.status(404).json({ error: 'Record not found' });
